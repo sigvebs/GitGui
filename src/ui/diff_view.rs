@@ -89,6 +89,7 @@ fn header(ui: &mut Ui, app: &mut App) {
                     Pane::Unstaged => "unstaged changes",
                     Pane::Staged => "staged changes",
                     Pane::Commit => "in this commit",
+                    Pane::Stash => "in this stash",
                 },
             ),
             None => ("No file selected".to_string(), ""),
@@ -131,7 +132,8 @@ fn header(ui: &mut Ui, app: &mut App) {
                             app.apply_lines(Op::Unstage);
                         }
                     }
-                    Pane::Commit => {}
+                    // Nothing to stage out of an immutable snapshot.
+                    Pane::Commit | Pane::Stash => {}
                 });
             }
             if let Some(s) = app.selection_summary() {
@@ -287,7 +289,7 @@ fn pane_op(pane: Pane) -> Option<Op> {
     match pane {
         Pane::Unstaged => Some(Op::Stage),
         Pane::Staged => Some(Op::Unstage),
-        Pane::Commit => None,
+        Pane::Commit | Pane::Stash => None,
     }
 }
 
@@ -459,8 +461,8 @@ fn handle_row(
                     }
                 }
             }
-            // Historical commits are immutable; nothing to offer.
-            Pane::Commit => {}
+            // Commits and stashes are immutable; nothing to offer.
+            Pane::Commit | Pane::Stash => {}
         }
         ui.separator();
         if ui.button("Select All Lines").clicked() {
@@ -629,7 +631,7 @@ pub fn hint_text(pane: Option<Pane>) -> &'static str {
         Some(Pane::Staged) => {
             "click a line · shift-click or drag for a range · ⌘-click to toggle · Space unstages · H unstages the hunk"
         }
-        Some(Pane::Commit) => "read-only · ⌘F to search this diff",
+        Some(Pane::Commit) | Some(Pane::Stash) => "read-only · ⌘F to search this diff",
         None => "",
     }
 }

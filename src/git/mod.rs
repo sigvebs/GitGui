@@ -1,6 +1,7 @@
 pub mod diff;
 pub mod log;
 pub mod patch;
+pub mod stash;
 pub mod status;
 
 use std::fmt;
@@ -313,6 +314,118 @@ impl Repo {
             args.push(o);
         }
         self.run(&args)
+    }
+
+    // ---- stashes --------------------------------------------------------
+
+    pub fn stash_list(&self) -> Result<Vec<stash::StashEntry>> {
+        if !self.has_head() {
+            return Ok(Vec::new());
+        }
+        // No `--date` here on purpose; see STASH_FORMAT.
+        let pretty = format!("--format={}", stash::STASH_FORMAT);
+        let raw = self.run_bytes(&["stash", "list", "-z", &pretty])?;
+        Ok(stash::parse_list(&raw))
+    }
+
+    /// Files a stash would restore. Tracked changes come from diffing the stash
+    /// against its first parent; untracked ones only exist in the third parent,
+    /// so they are listed separately and flagged.
+    pub fn stash_files(&self, e: &stash::StashEntry) -> Result<Vec<stash::StashFile>> {
+        let base = format!("{}^1", e.sha);
+        let raw = self.run_bytes(&[
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            &base,
+            &e.sha,
+        ])?;
+        let mut out: Vec<stash::StashFile> = log::parse_name_status(&raw)
+            .into_iter()
+            .map(|f| stash::StashFile {
+                status: f.status,
+                path: f.path,
+                orig_path: f.orig_path,
+                untracked: false,
+            })
+            .collect();
+
+        if let Some(parent) = e.untracked_parent() {
+            let raw = self.run_bytes(&["ls-tree", "-r", "--name-only", "-z", parent])?;
+            for path in stash::parse_paths(&raw) {
+                out.push(stash::StashFile {
+                    status: status::Change::Untracked,
+                    path,
+                    orig_path: None,
+                    untracked: true,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// Diff of one tracked path inside a stash.
+    ///
+    /// `git stash show -p -- <path>` cannot do this — it rejects the pathspec
+    /// as a second revision — so diff the stash against its first parent.
+    pub fn diff_stash(&self, sha: &str, path: &str, orig: Option<&str>) -> Result<String> {
+        let base = format!("{sha}^1");
+        let mut args = vec![
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U3",
+            "--find-renames",
+            &base,
+            sha,
+            "--",
+            path,
+        ];
+        if let Some(o) = orig {
+            args.push(o);
+        }
+        self.run(&args)
+    }
+
+    /// Raw bytes of an untracked file held in a stash's third parent.
+    pub fn stash_untracked_blob(&self, parent: &str, path: &str) -> Result<Vec<u8>> {
+        self.run_bytes(&["show", &format!("{parent}:{path}")])
+    }
+
+    pub fn stash_push(&self, message: &str, include_untracked: bool) -> Result<String> {
+        let mut args = vec!["stash", "push"];
+        if include_untracked {
+            args.push("--include-untracked");
+        }
+        let msg = message.trim();
+        if !msg.is_empty() {
+            args.push("-m");
+            args.push(msg);
+        }
+        self.run(&args)
+    }
+
+    pub fn stash_apply(&self, refname: &str) -> Result<String> {
+        self.run(&["stash", "apply", refname])
+    }
+
+    pub fn stash_pop(&self, refname: &str) -> Result<String> {
+        self.run(&["stash", "pop", refname])
+    }
+
+    pub fn stash_drop(&self, refname: &str) -> Result<String> {
+        self.run(&["stash", "drop", refname])
+    }
+
+    /// Re-creates a dropped stash entry from its commit, which survives in the
+    /// object store long enough for an undo to work.
+    pub fn stash_store(&self, sha: &str, message: &str) -> Result<String> {
+        self.run(&["stash", "store", "-m", message, sha])
     }
 
     pub fn last_commit_message(&self) -> Result<String> {

@@ -4,9 +4,9 @@ A small, fast commit-crafting GUI in the spirit of the `git gui` that ships with
 Git for Windows — four panes, no ceremony, and **staging or unstaging individual
 lines** as a first-class operation.
 
-It also browses history and searches diffs. Runs natively on macOS and Windows
-from one codebase (Rust + [egui]). One self-contained binary, no runtime to
-install.
+It also browses history and stashes, searches diffs, and pushes. Runs natively on
+macOS and Windows from one codebase (Rust + [egui]). One self-contained binary,
+no runtime to install.
 
 ```
 ┌ Unstaged Changes ─────┬ diff ─────────────────────────────────┐
@@ -102,6 +102,35 @@ you can hunt for a line and then stage what you had already picked out.
 Case folding is done one character at a time, which keeps highlight columns
 aligned with the rendered text. Full Unicode lowercasing can change a string's
 length and would smear the highlight rectangles.
+
+## Stashes
+
+The **Stashes** tab lists every entry with its message, originating branch and
+date, an `+untracked` marker where relevant, and a filter box. Selecting one
+shows the files it holds and their diffs; **Apply**, **Pop** and **Drop…** are on
+the detail panel and the right-click menu. **Stash…** in the Working Tree
+toolbar puts the current changes aside, with an option to include untracked
+files.
+
+Stash contents are read-only, like commits.
+
+Dropping asks first *and* is undoable with `⌘Z` — the entry disappears but its
+commit does not, so `git stash store` can put it back.
+
+Three things needed care here, each with a test:
+
+- **`%gd` is rendered through `--date`.** Asking for a short date turns
+  `stash@{0}` into `stash@{2026-08-07}`, which is not a usable ref. Refs are
+  derived from list position instead.
+- **`git stash show -p -- <path>` does not work** — it rejects the pathspec as a
+  second revision. Per-file diffs come from `git diff <stash>^1 <stash> -- <path>`.
+- **Untracked files live in a third parent** and are absent from the stash
+  commit's own tree, so no diff against the first parent can show them. They are
+  listed from `ls-tree` on that parent and rendered by reading the blob, the same
+  way an untracked working-tree file is shown.
+
+A failed apply or pop (a conflict, typically) reports git's message in full and
+leaves the entry in place.
 
 ## Pushing
 
@@ -234,18 +263,27 @@ Produces `dist/Git GUI.app`, which you can drag to `/Applications`. Drop an
 cargo test
 ```
 
-107 tests: diff parsing, patch construction, porcelain-v2 status parsing, commit
-log and name-status parsing, end-to-end staging against temporary repositories,
-undo round-trips, history browsing (including merge, rename and root commits),
-diff search, push against a local bare remote (success, up-to-date, rejected
-non-fast-forward, force-with-lease, and every refusal case), `App`-level flows
-for every gesture the UI exposes, and headless runs of the real widget tree
-across every state (untracked, binary, deleted, conflicted, both panes, history,
-find bar, push dialog, modals, welcome screen) to catch panics and egui id
-collisions.
+136 tests. Everything is exercised against real temporary repositories — no
+mocked git.
 
-Push is tested for real: the suite creates a bare repository, wires it up as a
-remote, and pushes to it. No network or credentials involved.
+- **Parsing**: unified diffs, partial-patch construction, porcelain-v2 status,
+  commit log and name-status, stash list.
+- **Staging**: lines, hunks, replacement pairs, deletions, untracked files, CRLF,
+  files with no trailing newline, and undo round-trips.
+- **History**: merge, rename and root commits; diff search.
+- **Stashes**: tracked-only, `-u` with untracked files from the third parent,
+  apply, pop, conflicting pop, drop with undo, and every refusal case.
+- **Push**: against a bare repository created by the suite — success,
+  up-to-date, rejected non-fast-forward, force-with-lease. No network or
+  credentials involved.
+- **Clicking** (`tests/clicking.rs`): synthetic pointer events through the real
+  widget tree. These exist because the state-level tests all called
+  `select_file()` directly and so could not see a bug where list rows were only
+  clickable on their text. One test clicks far to the right of a short filename
+  specifically to guard that.
+- **Rendering**: headless runs across every state — untracked, binary, deleted,
+  conflicted, both panes, history, stashes, find bar, push dialog, modals,
+  welcome screen — to catch panics and egui id collisions.
 
 ## Not implemented
 
@@ -259,7 +297,9 @@ Deliberate gaps, so you know what you are getting:
   a credential helper or SSH key once and it works.
 - **The history browser is read-only.** No cherry-pick, revert, reset,
   checking out a commit, or diffing two arbitrary commits against each other.
-- **No stash, no rebase.**
+- **No rebase, no cherry-pick, no revert.**
+- **No partial stashing.** A stash takes the whole working tree; git only offers
+  `stash push -p` interactively, which does not fit this UI.
 - **No commit graph drawing.** Commits are a flat list, not gitk's branch lanes.
 - **Search covers the open diff only**, not the whole repository or history.
   `git grep` and `git log -S` are the tools for that.
@@ -277,6 +317,7 @@ src/git/status.rs   porcelain-v2 -z parser
 src/git/diff.rs     unified-diff parser, synthetic new-file diffs
 src/git/patch.rs    partial-patch construction (the core of this app)
 src/git/log.rs      commit log and per-commit file list parsing
+src/git/stash.rs    stash entries and their three-parent structure
 src/app.rs          state, selection model, search, operations
 src/ui/mod.rs       panes, commit box, history browser, menus, modals
 src/ui/diff_view.rs the virtualised diff widget, selection gestures, find bar

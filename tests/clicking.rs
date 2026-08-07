@@ -234,6 +234,58 @@ fn clicking_the_empty_space_beside_a_short_filename_still_selects_the_row() {
 }
 
 #[test]
+fn clicking_a_stash_then_a_file_shows_the_diff() {
+    let t = TempRepo::new("click-stash");
+    t.write("a.txt", "one\n");
+    t.commit_all("base");
+    t.write("a.txt", "one\nstashed line\n");
+    t.git(&["stash", "push", "-q", "-m", "for clicking"]);
+
+    let mut h = Harness::new();
+    let mut app = app_on(&t);
+    app.set_mode(Mode::Stashes);
+    h.frames(&mut app, 2);
+    assert_eq!(app.stashes.len(), 1);
+
+    // Click the stash row.
+    let mut picked = None;
+    for y in [70.0_f32, 78.0, 86.0, 94.0, 102.0] {
+        app.sel_stash = None;
+        app.stash_files.clear();
+        h.frames(&mut app, 1);
+        h.click(&mut app, egui::pos2(200.0, y));
+        if app.sel_stash.is_some() {
+            picked = Some(y);
+            break;
+        }
+    }
+    picked.expect("no stash row responded to a click");
+    assert!(!app.stash_files.is_empty(), "should list the stash's files");
+
+    // Click the file row below.
+    let ys: Vec<f32> = (0..14).map(|i| 470.0 + i as f32 * 6.0).collect();
+    let mut hit = false;
+    for y in ys {
+        app.select_stash(0);
+        app.sel_file = None;
+        app.diff = None;
+        h.frames(&mut app, 1);
+        h.click(&mut app, egui::pos2(200.0, y));
+        if app.sel_file.is_some() {
+            hit = true;
+            break;
+        }
+    }
+    assert!(hit, "no stash file row responded to a click");
+    assert_eq!(app.sel_file.as_ref().map(|s| s.pane), Some(Pane::Stash));
+    assert!(
+        app.diff.is_some(),
+        "file selected but no diff loaded; err={:?}",
+        app.error
+    );
+}
+
+#[test]
 fn clicking_a_diff_line_selects_it_for_staging() {
     let t = TempRepo::new("click-diffline");
     t.write("a.txt", "one\ntwo\nthree\n");

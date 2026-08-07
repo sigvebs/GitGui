@@ -6,6 +6,7 @@ use crate::config;
 use crate::git::diff::{self, FileDiff, LineKind};
 use crate::git::log::{CommitFile, CommitInfo, CommitMeta};
 use crate::git::patch::{self, ApplyMode};
+use crate::git::stash::{StashEntry, StashFile};
 use crate::git::status::Status;
 use crate::git::{PushOptions, Repo};
 
@@ -17,6 +18,7 @@ const MAX_DISPLAY_BYTES: usize = 4 * 1024 * 1024;
 pub enum Mode {
     WorkingTree,
     History,
+    Stashes,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -25,11 +27,13 @@ pub enum Pane {
     Staged,
     /// A file inside a historical commit. Read-only.
     Commit,
+    /// A file inside a stash. Read-only.
+    Stash,
 }
 
 impl Pane {
     pub fn read_only(self) -> bool {
-        self == Pane::Commit
+        matches!(self, Pane::Commit | Pane::Stash)
     }
 }
 
@@ -269,6 +273,7 @@ impl Loaded {
 /// file outright.
 pub enum Confirm {
     DiscardFile { path: String, untracked: bool },
+    DropStash { refname: String, label: String },
 }
 
 /// A git command running off the UI thread. Only network operations need this;
@@ -292,6 +297,8 @@ enum UndoAction {
     /// Rewrite a file that was deleted wholesale. Raw bytes rather than a patch
     /// so untracked binaries survive too.
     RestoreFile { path: String, bytes: Vec<u8> },
+    /// Put a dropped stash entry back; its commit outlives the entry.
+    RestoreStash { sha: String, message: String },
 }
 
 pub struct UndoEntry {
@@ -357,6 +364,15 @@ pub struct App {
     pub push_tags: bool,
     pub running: Option<RunningTask>,
     pub outcome: Option<TaskOutcome>,
+
+    // Stashes.
+    pub stashes: Vec<StashEntry>,
+    pub stash_filter: String,
+    pub sel_stash: Option<usize>,
+    pub stash_files: Vec<StashFile>,
+    pub show_stash_dialog: bool,
+    pub stash_message: String,
+    pub stash_untracked: bool,
 }
 
 impl Default for App {
@@ -397,6 +413,13 @@ impl Default for App {
             push_tags: false,
             running: None,
             outcome: None,
+            stashes: Vec::new(),
+            stash_filter: String::new(),
+            sel_stash: None,
+            stash_files: Vec::new(),
+            show_stash_dialog: false,
+            stash_message: String::new(),
+            stash_untracked: true,
         }
     }
 }
@@ -510,8 +533,12 @@ impl App {
         self.sel_file = None;
         self.diff = None;
         self.find.matches.clear();
-        if mode == Mode::History && self.commits.is_empty() {
-            self.load_log();
+        match mode {
+            Mode::History if self.commits.is_empty() => self.load_log(),
+            // Always reload stashes: they change from outside far more often
+            // than history does, and the list is cheap.
+            Mode::Stashes => self.load_stashes(),
+            _ => {}
         }
     }
 
@@ -575,6 +602,174 @@ impl App {
     pub fn filtered_commits(&self) -> Vec<&CommitInfo> {
         let needle = self.commit_filter.trim().to_lowercase();
         self.commits.iter().filter(|c| c.matches(&needle)).collect()
+    }
+
+    // ---- stashes --------------------------------------------------------
+
+    pub fn load_stashes(&mut self) {
+        let Some(repo) = self.repo() else { return };
+        match repo.stash_list() {
+            Ok(list) => {
+                self.stashes = list;
+                // Indices shift whenever an entry is added or removed, so a
+                // held selection can no longer be trusted.
+                if self
+                    .sel_stash
+                    .map(|i| i >= self.stashes.len())
+                    .unwrap_or(false)
+                {
+                    self.clear_stash_selection();
+                }
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    fn clear_stash_selection(&mut self) {
+        self.sel_stash = None;
+        self.stash_files.clear();
+        if self.sel_file.as_ref().map(|s| s.pane) == Some(Pane::Stash) {
+            self.sel_file = None;
+            self.diff = None;
+        }
+    }
+
+    pub fn select_stash(&mut self, index: usize) {
+        let Some(repo) = self.repo() else { return };
+        let Some(entry) = self.stashes.get(index).cloned() else {
+            return;
+        };
+        self.sel_stash = Some(index);
+        self.sel_file = None;
+        self.diff = None;
+        self.find.matches.clear();
+        match repo.stash_files(&entry) {
+            Ok(f) => self.stash_files = f,
+            Err(e) => {
+                self.stash_files.clear();
+                self.error = Some(e.to_string());
+            }
+        }
+    }
+
+    pub fn selected_stash(&self) -> Option<&StashEntry> {
+        self.stashes.get(self.sel_stash?)
+    }
+
+    pub fn filtered_stashes(&self) -> Vec<&StashEntry> {
+        let needle = self.stash_filter.trim().to_lowercase();
+        self.stashes.iter().filter(|s| s.matches(&needle)).collect()
+    }
+
+    pub fn open_stash_dialog(&mut self) {
+        if self.status.unstaged().is_empty() && self.status.staged().is_empty() {
+            self.error = Some("Nothing to stash — the working tree is clean.".into());
+            return;
+        }
+        self.stash_message.clear();
+        self.stash_untracked = self.status.entries.iter().any(|e| e.untracked);
+        self.show_stash_dialog = true;
+    }
+
+    pub fn create_stash(&mut self) {
+        let Some(repo) = self.repo() else { return };
+        let msg = self.stash_message.clone();
+        let untracked = self.stash_untracked;
+        match repo.stash_push(&msg, untracked) {
+            Ok(_) => {
+                self.show_stash_dialog = false;
+                self.stash_message.clear();
+                self.info = Some("Stashed the working tree.".into());
+                self.sel_file = None;
+                self.diff = None;
+                self.rescan();
+                self.load_stashes();
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// `pop` also removes the entry once it applies cleanly.
+    pub fn apply_stash(&mut self, index: usize, pop: bool) {
+        let Some(repo) = self.repo() else { return };
+        let Some(entry) = self.stashes.get(index).cloned() else {
+            return;
+        };
+        let refname = entry.refname();
+        let res = if pop {
+            repo.stash_pop(&refname)
+        } else {
+            repo.stash_apply(&refname)
+        };
+        match res {
+            Ok(out) => {
+                let verb = if pop { "Popped" } else { "Applied" };
+                self.info = Some(format!("{verb} {refname}."));
+                if !out.trim().is_empty() {
+                    self.outcome = Some(TaskOutcome {
+                        ok: true,
+                        title: format!("{verb} {refname}"),
+                        output: out.trim().to_string(),
+                    });
+                }
+                self.clear_stash_selection();
+                self.rescan();
+                self.load_stashes();
+            }
+            Err(e) => {
+                // Conflicts land here; the message from git explains what to do.
+                self.outcome = Some(TaskOutcome {
+                    ok: false,
+                    title: format!("Could not {} {refname}", if pop { "pop" } else { "apply" }),
+                    output: e.to_string(),
+                });
+                self.error = Some(format!("{refname} did not apply cleanly."));
+                self.rescan();
+                self.load_stashes();
+            }
+        }
+    }
+
+    pub fn ask_drop_stash(&mut self, index: usize) {
+        let Some(entry) = self.stashes.get(index) else {
+            return;
+        };
+        self.confirm = Some(Confirm::DropStash {
+            refname: entry.refname(),
+            label: format!("{} — {}", entry.refname(), entry.message()),
+        });
+    }
+
+    fn do_drop_stash(&mut self, refname: &str) {
+        let Some(repo) = self.repo() else { return };
+        // Capture the commit first: the entry disappears but the commit does
+        // not, so the drop can be undone.
+        let entry = self
+            .stashes
+            .iter()
+            .find(|s| s.refname() == refname)
+            .cloned();
+
+        match repo.stash_drop(refname) {
+            Ok(_) => {
+                if let Some(e) = entry {
+                    let label = format!("{refname} — {}", e.message());
+                    self.push_undo(
+                        UndoAction::RestoreStash {
+                            sha: e.sha.clone(),
+                            message: e.subject.clone(),
+                        },
+                        label,
+                    );
+                    self.info = Some(format!("Dropped {refname}. ⌘Z to undo."));
+                } else {
+                    self.info = Some(format!("Dropped {refname}."));
+                }
+                self.clear_stash_selection();
+                self.load_stashes();
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
     }
 
     // ---- diff search ----------------------------------------------------
@@ -681,8 +876,9 @@ impl App {
         let still_there = match sel.pane {
             Pane::Unstaged => self.status.unstaged().iter().any(|e| e.path == sel.path),
             Pane::Staged => self.status.staged().iter().any(|e| e.path == sel.path),
-            // Commit contents are immutable, so a rescan never invalidates them.
-            Pane::Commit => true,
+            // Commit and stash contents are immutable, so a rescan never
+            // invalidates them.
+            Pane::Commit | Pane::Stash => true,
         };
         if still_there {
             let cursor = self.diff.as_ref().map(|d| d.cursor).unwrap_or(0);
@@ -715,10 +911,37 @@ impl App {
         let untracked = entry.as_ref().map(|e| e.untracked).unwrap_or(false);
         let unmerged = entry.as_ref().map(|e| e.unmerged).unwrap_or(false);
 
+        // Untracked files inside a stash are not in its tree at all, so they
+        // have to be read out of the third parent instead of diffed.
+        let stash_untracked = sel.pane == Pane::Stash
+            && self
+                .stash_files
+                .iter()
+                .any(|f| f.path == sel.path && f.untracked);
+        let stash_ctx: Option<(String, Option<String>)> = self.selected_stash().map(|e| {
+            let orig = self
+                .stash_files
+                .iter()
+                .find(|f| f.path == sel.path)
+                .and_then(|f| f.orig_path.clone());
+            (e.sha.clone(), orig)
+        });
+        let stash_parent = self
+            .selected_stash()
+            .and_then(|e| e.untracked_parent().map(|p| p.to_string()));
+
         let result: Result<(FileDiff, Option<String>), String> = if sel.pane == Pane::Unstaged
             && untracked
         {
             self.read_untracked(&repo.root, &sel.path)
+        } else if stash_untracked {
+            match stash_parent {
+                Some(parent) => read_stash_blob(&repo, &parent, &sel.path),
+                None => Ok((
+                    FileDiff::default(),
+                    Some("This stash holds no untracked files.".to_string()),
+                )),
+            }
         } else {
             let text = match sel.pane {
                 Pane::Unstaged => repo.diff_unstaged(&sel.path),
@@ -735,6 +958,10 @@ impl App {
                             .and_then(|f| f.orig_path.clone());
                         repo.diff_commit(sha, &sel.path, orig.as_deref())
                     }
+                    None => Ok(String::new()),
+                },
+                Pane::Stash => match &stash_ctx {
+                    Some((sha, orig)) => repo.diff_stash(sha, &sel.path, orig.as_deref()),
                     None => Ok(String::new()),
                 },
             };
@@ -827,7 +1054,7 @@ impl App {
         match self.sel_file.as_ref()?.pane {
             Pane::Unstaged => Some(Op::Stage),
             Pane::Staged => Some(Op::Unstage),
-            Pane::Commit => None,
+            Pane::Commit | Pane::Stash => None,
         }
     }
 
@@ -868,6 +1095,9 @@ impl App {
         match c {
             Confirm::DiscardFile { path, untracked } => {
                 self.do_discard_file(&path, untracked);
+            }
+            Confirm::DropStash { refname, .. } => {
+                self.do_drop_stash(&refname);
             }
         }
     }
@@ -947,6 +1177,10 @@ impl App {
                 }
                 std::fs::write(&full, bytes).map_err(|e| e.to_string())
             }
+            UndoAction::RestoreStash { sha, message } => repo
+                .stash_store(sha, message)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
         };
 
         match res {
@@ -1321,6 +1555,49 @@ impl App {
         });
         Some(format!("{n} line(s) selected  +{adds} −{dels}"))
     }
+}
+
+/// Presents an untracked file stored in a stash as an add-everything diff, the
+/// same way an untracked file in the working tree is shown.
+fn read_stash_blob(
+    repo: &Repo,
+    parent: &str,
+    path: &str,
+) -> Result<(FileDiff, Option<String>), String> {
+    let bytes = repo
+        .stash_untracked_blob(parent, path)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_DISPLAY_BYTES {
+        return Ok((
+            FileDiff::default(),
+            Some(format!(
+                "File is {:.1} MB — too large to display.",
+                bytes.len() as f64 / (1024.0 * 1024.0)
+            )),
+        ));
+    }
+    if bytes.contains(&0) {
+        return Ok((
+            FileDiff::default(),
+            Some("Binary file — stored in the stash but not shown.".to_string()),
+        ));
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            return Ok((
+                FileDiff::default(),
+                Some("Not valid UTF-8 — not shown.".to_string()),
+            ))
+        }
+    };
+    let fd = diff::synth_new_file(path, &text, false);
+    let note = if fd.hunks.is_empty() {
+        Some("Empty file.".to_string())
+    } else {
+        None
+    };
+    Ok((fd, note))
 }
 
 #[cfg(unix)]

@@ -45,6 +45,19 @@ pub fn draw(ctx: &egui::Context, app: &mut App) {
                     .show_inside(ui, |ui| diff_view::show(ui, app));
             });
         }
+        Mode::Stashes => {
+            stash_panel(ctx, app);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::TopBottomPanel::bottom("stash-detail")
+                    .resizable(true)
+                    .default_height(140.0)
+                    .min_height(72.0)
+                    .show_inside(ui, |ui| stash_detail(ui, app));
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| diff_view::show(ui, app));
+            });
+        }
     }
 
     modals(ctx, app);
@@ -117,6 +130,18 @@ fn top_bar(ctx: &egui::Context, app: &mut App) {
                 {
                     app.set_mode(Mode::History);
                 }
+                let stash_label = if app.stashes.is_empty() {
+                    "Stashes".to_string()
+                } else {
+                    format!("Stashes ({})", app.stashes.len())
+                };
+                if ui
+                    .selectable_label(app.mode == Mode::Stashes, stash_label)
+                    .on_hover_text("Browse stashed changes")
+                    .clicked()
+                {
+                    app.set_mode(Mode::Stashes);
+                }
 
                 ui.separator();
                 if ui.button("Rescan").on_hover_text("Reload from disk  (⌘R)").clicked() {
@@ -136,6 +161,13 @@ fn top_bar(ctx: &egui::Context, app: &mut App) {
                         .clicked()
                     {
                         app.unstage_all();
+                    }
+                    if ui
+                        .button("Stash…")
+                        .on_hover_text("Put the working tree aside for later")
+                        .clicked()
+                    {
+                        app.open_stash_dialog();
                     }
                 }
                 if ui
@@ -676,6 +708,277 @@ fn commit_detail(ui: &mut Ui, app: &mut App) {
         });
 }
 
+fn stash_panel(ctx: &egui::Context, app: &mut App) {
+    egui::SidePanel::left("stashes")
+        .resizable(true)
+        .default_width(400.0)
+        .min_width(240.0)
+        .show(ctx, |ui| {
+            let half = (ui.available_height() * 0.55).max(140.0);
+            egui::TopBottomPanel::top("stash-list")
+                .resizable(true)
+                .default_height(half)
+                .min_height(100.0)
+                .show_inside(ui, |ui| stash_list(ui, app));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show_inside(ui, |ui| stash_file_list(ui, app));
+        });
+}
+
+fn stash_list(ui: &mut Ui, app: &mut App) {
+    let pal = Palette::new(ui.visuals().dark_mode);
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Stashes").strong().small());
+        let total = app.stashes.len();
+        let shown = app.filtered_stashes().len();
+        let count = if shown == total {
+            format!("{total}")
+        } else {
+            format!("{shown}/{total}")
+        };
+        ui.label(egui::RichText::new(count).color(pal.note_fg).small());
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Stash…")
+                .on_hover_text("Stash the current working tree")
+                .clicked()
+            {
+                app.open_stash_dialog();
+            }
+        });
+    });
+
+    if !app.stashes.is_empty() {
+        ui.add(
+            egui::TextEdit::singleline(&mut app.stash_filter)
+                .desired_width(f32::INFINITY)
+                .hint_text("filter stashes"),
+        );
+        ui.add_space(2.0);
+    }
+
+    // (index, refname, message, branch, date, untracked)
+    let rows: Vec<(usize, String, String, String, String, bool)> = app
+        .filtered_stashes()
+        .iter()
+        .map(|s| {
+            (
+                s.index,
+                s.refname(),
+                s.message().to_string(),
+                s.branch().unwrap_or("").to_string(),
+                s.date.clone(),
+                s.has_untracked(),
+            )
+        })
+        .collect();
+
+    let mut clicked: Option<usize> = None;
+    let mut apply: Option<(usize, bool)> = None;
+    let mut drop_it: Option<usize> = None;
+
+    egui::ScrollArea::vertical()
+        .id_salt("stash-list-scroll")
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            if rows.is_empty() {
+                let msg = if app.stashes.is_empty() {
+                    "No stashes. Use Stash… to put the working tree aside."
+                } else {
+                    "nothing matches the filter"
+                };
+                ui.label(egui::RichText::new(msg).color(pal.note_fg).small());
+            }
+            for (index, refname, message, branch, date, untracked) in &rows {
+                let selected = app.sel_stash == Some(*index);
+                let tag = format!("{{{}}}", index);
+                let mut cells = vec![Cell::new(&tag, pal.hunk_fg).mono()];
+                if !branch.is_empty() {
+                    cells.push(Cell::new(branch, pal.ref_badge));
+                }
+                cells.push(Cell::new(message, ui.visuals().text_color()));
+                let marker = if *untracked { "+untracked" } else { "" };
+                if !marker.is_empty() {
+                    cells.push(Cell::new(marker, pal.note_fg));
+                }
+
+                let resp = list_row(ui, selected, &cells, Some(Cell::new(date, pal.note_fg)));
+                if resp.clicked() {
+                    clicked = Some(*index);
+                }
+                resp.on_hover_text(format!(
+                    "{refname}\n{}\n{date}",
+                    if *untracked {
+                        "includes untracked files"
+                    } else {
+                        "tracked changes only"
+                    }
+                ))
+                .context_menu(|ui| {
+                    if ui
+                        .button("Apply (keep the stash)")
+                        .clicked()
+                    {
+                        apply = Some((*index, false));
+                        ui.close();
+                    }
+                    if ui.button("Pop (apply and remove)").clicked() {
+                        apply = Some((*index, true));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Drop…").clicked() {
+                        drop_it = Some(*index);
+                        ui.close();
+                    }
+                });
+            }
+        });
+
+    if let Some(i) = clicked {
+        app.select_stash(i);
+    }
+    if let Some((i, pop)) = apply {
+        app.apply_stash(i, pop);
+    }
+    if let Some(i) = drop_it {
+        app.ask_drop_stash(i);
+    }
+}
+
+fn stash_file_list(ui: &mut Ui, app: &mut App) {
+    let pal = Palette::new(ui.visuals().dark_mode);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Files in Stash").strong().small());
+        ui.label(
+            egui::RichText::new(format!("{}", app.stash_files.len()))
+                .color(pal.note_fg)
+                .small(),
+        );
+    });
+
+    let rows: Vec<(String, String, Change, bool)> = app
+        .stash_files
+        .iter()
+        .map(|f| {
+            let display = match &f.orig_path {
+                Some(o) => format!("{o} → {}", f.path),
+                None => f.path.clone(),
+            };
+            (f.path.clone(), display, f.status, f.untracked)
+        })
+        .collect();
+
+    let mut clicked: Option<String> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("stash-files-scroll")
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            if rows.is_empty() {
+                let msg = if app.sel_stash.is_none() {
+                    "select a stash"
+                } else {
+                    "no file changes"
+                };
+                ui.label(egui::RichText::new(msg).color(pal.note_fg).small());
+            }
+            for (path, display, status, untracked) in &rows {
+                let selected = app
+                    .sel_file
+                    .as_ref()
+                    .map(|s| s.pane == Pane::Stash && &s.path == path)
+                    .unwrap_or(false);
+                let mut cells = vec![
+                    Cell::new(status.letter(), change_color(*status, false))
+                        .mono()
+                        .strong(),
+                    Cell::new(display, ui.visuals().text_color()),
+                ];
+                if *untracked {
+                    cells.push(Cell::new("untracked", pal.note_fg));
+                }
+                let resp = list_row(ui, selected, &cells, None);
+                if resp.clicked() {
+                    clicked = Some(path.clone());
+                }
+                resp.on_hover_text(format!("{path} — {}", status.label()));
+            }
+        });
+
+    if let Some(p) = clicked {
+        app.select_file(Pane::Stash, &p);
+    }
+}
+
+fn stash_detail(ui: &mut Ui, app: &mut App) {
+    let pal = Palette::new(ui.visuals().dark_mode);
+    ui.add_space(4.0);
+
+    let Some(entry) = app.selected_stash().cloned() else {
+        ui.label(
+            egui::RichText::new("Select a stash to see what it holds")
+                .color(pal.note_fg)
+                .small(),
+        );
+        return;
+    };
+    let index = entry.index;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(entry.refname()).monospace().strong());
+        ui.label(
+            egui::RichText::new(&entry.sha[..entry.sha.len().min(10)])
+                .monospace()
+                .small()
+                .color(pal.hunk_fg),
+        );
+        ui.label(egui::RichText::new(&entry.date).color(pal.note_fg).small());
+        if entry.has_untracked() {
+            ui.label(
+                egui::RichText::new("includes untracked files")
+                    .small()
+                    .color(pal.ref_badge),
+            );
+        }
+    });
+    ui.label(egui::RichText::new(entry.message()).monospace());
+    if let Some(b) = entry.branch() {
+        ui.label(
+            egui::RichText::new(format!("stashed from {b}"))
+                .color(pal.note_fg)
+                .small(),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui
+            .button("Apply")
+            .on_hover_text("Restore these changes and keep the stash")
+            .clicked()
+        {
+            app.apply_stash(index, false);
+        }
+        if ui
+            .button("Pop")
+            .on_hover_text("Restore these changes and remove the stash")
+            .clicked()
+        {
+            app.apply_stash(index, true);
+        }
+        if ui
+            .add(egui::Button::new("Drop…"))
+            .on_hover_text("Delete this stash entry")
+            .clicked()
+        {
+            app.ask_drop_stash(index);
+        }
+    });
+}
+
 /// One cell of text in a list row.
 pub struct Cell<'a> {
     pub text: &'a str,
@@ -901,6 +1204,10 @@ fn truncate(s: &str, n: usize) -> String {
 fn modals(ctx: &egui::Context, app: &mut App) {
     if let Some(c) = app.confirm.as_ref() {
         let (title, body) = match c {
+            Confirm::DropStash { label, .. } => (
+                "Drop stash?",
+                format!("Delete {label}.\n\nThis can be undone with ⌘Z straight afterwards."),
+            ),
             Confirm::DiscardFile { path, untracked } => (
                 "Discard file?",
                 if *untracked {
@@ -923,8 +1230,13 @@ fn modals(ctx: &egui::Context, app: &mut App) {
                     if ui.button("Cancel").clicked() {
                         no = true;
                     }
+                    let verb = if title.starts_with("Drop") {
+                        "Drop"
+                    } else {
+                        "Discard"
+                    };
                     if ui
-                        .add(egui::Button::new("Discard").fill(Color32::from_rgb(160, 60, 60)))
+                        .add(egui::Button::new(verb).fill(Color32::from_rgb(160, 60, 60)))
                         .clicked()
                     {
                         yes = true;
@@ -935,6 +1247,66 @@ fn modals(ctx: &egui::Context, app: &mut App) {
             app.confirm_yes();
         } else if no {
             app.confirm = None;
+        }
+    }
+
+    if app.show_stash_dialog {
+        let mut go = false;
+        let mut cancel = false;
+        let dirty = app.status.unstaged().len() + app.status.staged().len();
+        let has_untracked = app.status.entries.iter().any(|e| e.untracked);
+        egui::Window::new("Stash Changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let pal = Palette::new(ui.visuals().dark_mode);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Set aside changes in {dirty} file(s) and return the \
+                         working tree to HEAD."
+                    ))
+                    .small(),
+                );
+                ui.add_space(6.0);
+                ui.label("Message (optional)");
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut app.stash_message)
+                        .desired_width(320.0)
+                        .hint_text("what you were in the middle of"),
+                );
+                r.request_focus();
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+
+                ui.add_space(6.0);
+                ui.add_enabled_ui(has_untracked, |ui| {
+                    ui.checkbox(&mut app.stash_untracked, "Include untracked files (-u)");
+                });
+                if !has_untracked {
+                    ui.label(
+                        egui::RichText::new("no untracked files to include")
+                            .color(pal.note_fg)
+                            .small(),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Stash").clicked() {
+                        go = true;
+                    }
+                });
+            });
+        if go {
+            app.create_stash();
+        } else if cancel {
+            app.show_stash_dialog = false;
+            app.stash_message.clear();
         }
     }
 
