@@ -135,12 +135,41 @@ impl TempRepo {
         self.git(&["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
     }
 
+    /// Leaves the repository mid-merge with one conflicted file, exactly as the
+    /// terminal would: `side` and `main` both changed the same line.
+    pub fn conflicted_merge(&self) {
+        self.write("shared.txt", "one\ntwo\nthree\n");
+        self.write("calm.txt", "untouched\n");
+        self.commit_all("base");
+
+        self.git(&["checkout", "-q", "-b", "side"]);
+        self.write("shared.txt", "one\nTHEIRS\nthree\n");
+        self.write("only-theirs.txt", "added on side\n");
+        self.commit_all("side edit");
+
+        self.git(&["checkout", "-q", "main"]);
+        self.write("shared.txt", "one\nOURS\nthree\n");
+        self.commit_all("main edit");
+
+        // Expected to fail: that is the conflict.
+        let out = std::process::Command::new("git")
+            .current_dir(&self.dir)
+            .args(["merge", "--no-edit", "side"])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "the merge was supposed to conflict: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
     pub fn unstaged_diff(&self, path: &str) -> diff::FileDiff {
         diff::parse(&self.repo.diff_unstaged(path).unwrap())
     }
 
     pub fn staged_diff(&self, path: &str) -> diff::FileDiff {
-        diff::parse(&self.repo.diff_staged(path, None).unwrap())
+        diff::parse(&self.repo.diff_staged(path, None, None).unwrap())
     }
 }
 

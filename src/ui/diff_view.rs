@@ -1,6 +1,6 @@
 use egui::{Align2, FontId, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
-use crate::app::{App, Loaded, Op, Pane, Row};
+use crate::app::{App, Loaded, Op, Pane, Row, TextPos};
 use crate::git::diff::LineKind;
 use crate::theme::Palette;
 
@@ -8,6 +8,8 @@ enum Pending {
     Lines(Op),
     Hunk(Op, usize),
     SelectHunk(usize),
+    Copy,
+    Edit,
 }
 
 #[derive(Default)]
@@ -22,6 +24,8 @@ struct Keys {
     primary: bool,
     discard: bool,
     hunk: bool,
+    copy: bool,
+    edit: bool,
 }
 
 pub fn show(ui: &mut Ui, app: &mut App) {
@@ -59,6 +63,8 @@ pub fn show(ui: &mut Ui, app: &mut App) {
         .map(|(i, m)| (m.row, m.start, m.end, i == app.find.current))
         .collect();
 
+    let mut copy_now = keys.copy;
+    let mut edit_now = keys.edit;
     {
         let loaded = app.diff.as_mut().expect("checked above");
         apply_keys(loaded, &keys, pane, &mut pending);
@@ -75,7 +81,26 @@ pub fn show(ui: &mut Ui, app: &mut App) {
                 d.select_hunk(h);
             }
         }
+        Some(Pending::Copy) => copy_now = true,
+        Some(Pending::Edit) => edit_now = true,
         None => {}
+    }
+
+    if edit_now {
+        app.edit_at_cursor();
+    }
+
+    if copy_now {
+        match app.diff.as_ref().and_then(|d| d.clipboard_text()) {
+            Some(text) => {
+                let lines = text.lines().count();
+                ui.ctx().copy_text(text);
+                app.info = Some(format!("Copied {lines} line(s) to the clipboard."));
+            }
+            None => {
+                app.info = Some("Nothing selected to copy.".to_string());
+            }
+        }
     }
 }
 
@@ -94,7 +119,20 @@ fn header(ui: &mut Ui, app: &mut App) {
             ),
             None => ("No file selected".to_string(), ""),
         };
-        ui.label(egui::RichText::new(title).strong());
+        if app.sel_file.is_some() {
+            let text = egui::RichText::new(title)
+                .strong()
+                .color(ui.visuals().hyperlink_color);
+            let resp = ui
+                .add(egui::Label::new(text).sense(Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Double-click to open this file in your editor");
+            if resp.double_clicked() {
+                app.edit_at_cursor();
+            }
+        } else {
+            ui.label(egui::RichText::new(title).strong());
+        }
         if !sub.is_empty() {
             ui.label(egui::RichText::new(sub).color(pal.note_fg).small());
         }
@@ -227,6 +265,12 @@ fn read_keys(ui: &Ui, pane: Pane) -> Keys {
     ui.input_mut(|i| {
         let extend = i.modifiers.shift;
         let cmd = i.modifiers.command;
+        // The host turns the copy shortcut into `Event::Copy` and never
+        // delivers the key itself, so watching for Key::C would never fire.
+        let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+        if copy {
+            i.events.retain(|e| !matches!(e, egui::Event::Copy));
+        }
         Keys {
             up: i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K),
             down: i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J),
@@ -239,6 +283,8 @@ fn read_keys(ui: &Ui, pane: Pane) -> Keys {
             discard: pane == Pane::Unstaged
                 && (i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)),
             hunk: i.key_pressed(egui::Key::H),
+            copy,
+            edit: i.key_pressed(egui::Key::E),
         }
     })
 }
@@ -266,6 +312,7 @@ fn apply_keys(loaded: &mut Loaded, k: &Keys, pane: Pane, pending: &mut Option<Pe
     }
     if k.clear {
         loaded.sel.clear();
+        loaded.clear_text_sel();
     }
     let Some(primary) = pane_op(pane) else {
         // Read-only pane: navigation and selection only.
@@ -314,6 +361,13 @@ fn paint_rows(
 
     let mut area = egui::ScrollArea::both()
         .id_salt("diff-rows")
+        // Dragging has to reach the rows so it can select text; with drag as a
+        // scroll source the area swallows the gesture and pans instead.
+        .scroll_source(egui::scroll_area::ScrollSource {
+            scroll_bar: true,
+            drag: false,
+            mouse_wheel: true,
+        })
         .auto_shrink([false; 2]);
 
     if std::mem::take(&mut loaded.scroll_to_cursor) {
@@ -334,6 +388,8 @@ fn paint_rows(
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
     if !primary_down {
         loaded.dragging = false;
+        loaded.text_dragging = false;
+        loaded.text_press = None;
     }
 
     let n = loaded.rows.len();
@@ -353,6 +409,9 @@ fn paint_rows(
                 primary_pressed,
                 pane,
                 pending,
+                font,
+                char_w,
+                gutter_w,
             );
 
             if !ui.is_rect_visible(rect) {
@@ -378,23 +437,67 @@ fn handle_row(
     primary_pressed: bool,
     pane: Pane,
     pending: &mut Option<Pending>,
+    font: &FontId,
+    char_w: f32,
+    gutter_w: f32,
 ) {
     let is_hunk_header = matches!(loaded.rows.get(i), Some(Row::Hunk(_)));
     let hunk = loaded.hunk_of_row(i);
+    let text_starts_at = rect.left() + gutter_w;
+    let (shift, cmd) = ui.input(|inp| (inp.modifiers.shift, inp.modifiers.command));
 
+    // A press in the line-number gutter picks lines for staging. Pressing over
+    // the text leaves the line selection alone until the gesture resolves into
+    // either a click or a drag, below.
     if primary_pressed && resp.contains_pointer() {
-        let (shift, cmd) = ui.input(|inp| (inp.modifiers.shift, inp.modifiers.command));
-        if is_hunk_header {
-            if let Some(h) = hunk {
-                *pending = Some(Pending::SelectHunk(h));
+        if let Some(p) = ui.input(|inp| inp.pointer.interact_pos()) {
+            if p.x < text_starts_at {
+                loaded.clear_text_sel();
+                loaded.text_press = None;
+                if shift {
+                    loaded.extend_to(i);
+                } else if cmd {
+                    loaded.toggle(i);
+                } else {
+                    loaded.select_only(i);
+                    loaded.dragging = true;
+                }
+            } else {
+                // Remember where the gesture began. egui only reports a drag
+                // once the pointer has travelled a few pixels, and by then it
+                // has left the character it started on.
+                let col = column_at(ui, loaded, i, rect, p.x, font, char_w, gutter_w);
+                loaded.text_press = Some(TextPos { row: i, col });
             }
-        } else if shift {
-            loaded.extend_to(i);
-        } else if cmd {
-            loaded.toggle(i);
-        } else {
-            loaded.select_only(i);
-            loaded.dragging = true;
+        }
+    }
+
+    // Dragging across the text selects characters instead of lines.
+    if resp.drag_started() {
+        if let Some(anchor) = loaded.text_press {
+            loaded.begin_text_sel(anchor);
+        }
+    }
+
+    // A plain click over the text keeps the old meaning: pick this line, or the
+    // whole hunk when it lands on a header.
+    if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            if p.x >= text_starts_at {
+                loaded.clear_text_sel();
+                loaded.text_press = None;
+                if is_hunk_header {
+                    if let Some(h) = hunk {
+                        *pending = Some(Pending::SelectHunk(h));
+                    }
+                } else if shift {
+                    loaded.extend_to(i);
+                } else if cmd {
+                    loaded.toggle(i);
+                } else {
+                    loaded.select_only(i);
+                }
+            }
         }
     }
 
@@ -404,6 +507,15 @@ fn handle_row(
         if let Some(p) = ui.input(|inp| inp.pointer.interact_pos()) {
             if p.y >= rect.top() && p.y < rect.bottom() && i != loaded.cursor {
                 loaded.extend_to(i);
+            }
+        }
+    }
+
+    if loaded.text_dragging {
+        if let Some(p) = ui.input(|inp| inp.pointer.interact_pos()) {
+            if p.y >= rect.top() && p.y < rect.bottom() {
+                let col = column_at(ui, loaded, i, rect, p.x, font, char_w, gutter_w);
+                loaded.set_text_head(TextPos { row: i, col });
             }
         }
     }
@@ -465,11 +577,127 @@ fn handle_row(
             Pane::Commit | Pane::Stash => {}
         }
         ui.separator();
+        if ui
+            .button("Edit at This Line")
+            .on_hover_text("Open this line in your editor  (E)")
+            .clicked()
+        {
+            *pending = Some(Pending::Edit);
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                loaded.clipboard_text().is_some(),
+                egui::Button::new("Copy"),
+            )
+            .on_hover_text("Copy the selected text, or the selected lines")
+            .clicked()
+        {
+            *pending = Some(Pending::Copy);
+            ui.close();
+        }
         if ui.button("Select All Lines").clicked() {
             loaded.select_all();
             ui.close();
         }
     });
+}
+
+/// Where a row's own text starts, measured from the row's left edge. Rows that
+/// carry no file content have none, so nothing in them can be selected.
+fn text_origin(loaded: &Loaded, row: usize, char_w: f32, gutter_w: f32) -> Option<f32> {
+    match loaded.rows.get(row)? {
+        // The marker column belongs to the gutter as far as selecting goes,
+        // which is what keeps a copied block free of stray + and - signs.
+        Row::Line { hunk, line } => {
+            let l = loaded.fd.hunks.get(*hunk)?.lines.get(*line)?;
+            if l.kind == LineKind::NoNewline {
+                None
+            } else {
+                Some(gutter_w + char_w)
+            }
+        }
+        Row::Hunk(_) => Some(char_w),
+        Row::Note(_) => None,
+    }
+}
+
+/// Lays out one row's text the same way the painter does, so positions and
+/// columns agree exactly. A tab is four cells wide, not one, which is why none
+/// of this can be done by multiplying a character width.
+fn row_galley(
+    ui: &Ui,
+    loaded: &Loaded,
+    row: usize,
+    font: &FontId,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    let text = loaded.row_text(row)?;
+    Some(ui.fonts(|f| f.layout_no_wrap(text, font.clone(), egui::Color32::WHITE)))
+}
+
+/// Character column under a pointer x.
+fn column_at(
+    ui: &Ui,
+    loaded: &Loaded,
+    row: usize,
+    rect: &Rect,
+    x: f32,
+    font: &FontId,
+    char_w: f32,
+    gutter_w: f32,
+) -> usize {
+    let Some(origin) = text_origin(loaded, row, char_w, gutter_w) else {
+        return 0;
+    };
+    let Some(galley) = row_galley(ui, loaded, row, font) else {
+        return 0;
+    };
+    let rel = x - (rect.left() + origin);
+    if rel <= 0.0 {
+        return 0;
+    }
+    galley.cursor_from_pos(Vec2::new(rel, 0.0)).index
+}
+
+/// The x offsets, from the row's left edge, that bracket a column range.
+fn column_bounds(
+    galley: &egui::Galley,
+    origin: f32,
+    from: usize,
+    to: usize,
+) -> (f32, f32) {
+    let x0 = galley.pos_from_cursor(egui::text::CCursor::new(from)).min.x;
+    let x1 = galley.pos_from_cursor(egui::text::CCursor::new(to)).min.x;
+    (origin + x0, origin + x1)
+}
+
+fn paint_text_selection(
+    ui: &Ui,
+    loaded: &Loaded,
+    row: usize,
+    rect: Rect,
+    font: &FontId,
+    char_w: f32,
+    gutter_w: f32,
+) {
+    let Some((from, to)) = loaded.text_sel_span(row) else {
+        return;
+    };
+    let Some(origin) = text_origin(loaded, row, char_w, gutter_w) else {
+        return;
+    };
+    let Some(galley) = row_galley(ui, loaded, row, font) else {
+        return;
+    };
+    let (x0, x1) = column_bounds(&galley, origin, from, to);
+    ui.painter().rect_filled(
+        Rect::from_min_max(
+            egui::pos2(rect.left() + x0, rect.top()),
+            egui::pos2(rect.left() + x1, rect.bottom()),
+        ),
+        0.0,
+        ui.visuals().selection.bg_fill,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -504,6 +732,9 @@ fn paint_row(
         Some(Row::Hunk(h)) => {
             let hunk = &loaded.fd.hunks[*h];
             p.rect_filled(rect, 0.0, pal.hunk_bg);
+            paint_text_selection(
+                ui, loaded, i, rect, font, char_w, gutter_w,
+            );
             p.text(
                 egui::pos2(rect.left() + char_w, rect.center().y),
                 Align2::LEFT_CENTER,
@@ -538,6 +769,10 @@ fn paint_row(
                     pal.sel_bar,
                 );
             }
+
+            paint_text_selection(
+                ui, loaded, i, rect, font, char_w, gutter_w,
+            );
 
             // Search hits sit above the row tint but below the glyphs. Columns
             // map exactly to pixels because the font is monospaced.
@@ -626,12 +861,14 @@ fn line_no_digits(loaded: &Loaded) -> usize {
 pub fn hint_text(pane: Option<Pane>) -> &'static str {
     match pane {
         Some(Pane::Unstaged) => {
-            "click a line · shift-click or drag for a range · ⌘-click to toggle · Space stages · H stages the hunk · ⌫ discards"
+            "click a line · shift-click or gutter-drag for a range · ⌘-click to toggle · drag the text to select it · Space stages · H stages the hunk · E edits · ⌫ discards"
         }
         Some(Pane::Staged) => {
-            "click a line · shift-click or drag for a range · ⌘-click to toggle · Space unstages · H unstages the hunk"
+            "click a line · shift-click or gutter-drag for a range · ⌘-click to toggle · drag the text to select it · Space unstages · H unstages the hunk · E edits"
         }
-        Some(Pane::Commit) | Some(Pane::Stash) => "read-only · ⌘F to search this diff",
+        Some(Pane::Commit) | Some(Pane::Stash) => {
+            "read-only · E opens your editor · drag the text to select it · ⌘C copies · ⌘F to search this diff"
+        }
         None => "",
     }
 }

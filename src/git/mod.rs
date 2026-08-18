@@ -18,6 +18,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const DIFF_CONTEXT: u32 = 3;
 
+pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 #[derive(Debug, Clone)]
 pub struct GitError(pub String);
 
@@ -230,13 +232,42 @@ impl Repo {
         self.run(&self.diff_args(&[], &[path]))
     }
 
-    /// HEAD -> index
-    pub fn diff_staged(&self, path: &str, orig: Option<&str>) -> Result<String> {
+    /// base -> index
+    pub fn diff_staged(
+        &self,
+        path: &str,
+        orig: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<String> {
         let mut paths = vec![path];
         if let Some(o) = orig {
             paths.push(o);
         }
-        self.run(&self.diff_args(&["--cached", "--find-renames"], &paths))
+        let mut extra = vec!["--cached", "--find-renames"];
+        if let Some(b) = base {
+            extra.push(b);
+        }
+        self.run(&self.diff_args(&extra, &paths))
+    }
+
+    pub fn amend_base(&self) -> String {
+        if self.run(&["rev-parse", "--verify", "--quiet", "HEAD^"]).is_ok() {
+            "HEAD^".to_string()
+        } else {
+            EMPTY_TREE.to_string()
+        }
+    }
+
+    pub fn staged_files(&self, base: &str) -> Result<Vec<log::CommitFile>> {
+        let raw = self.run_bytes(&[
+            "diff",
+            "--cached",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            base,
+        ])?;
+        Ok(log::parse_name_status(&raw))
     }
 
     // ---- history --------------------------------------------------------
@@ -490,6 +521,52 @@ impl Repo {
         }
     }
 
+    /// Name of the branch being merged in, or None when no merge is underway.
+    /// `MERGE_HEAD` only exists between a conflicted merge and its commit.
+    pub fn merge_head(&self) -> Option<String> {
+        self.run(&["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).ok()?;
+        if let Ok(name) = self.run(&["name-rev", "--name-only", "MERGE_HEAD"]) {
+            let name = name.trim().to_string();
+            if !name.is_empty() && name != "undefined" {
+                return Some(name);
+            }
+        }
+        self.run(&["rev-parse", "--short", "MERGE_HEAD"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The message git prepared for the merge commit, comments stripped.
+    pub fn merge_message(&self) -> Option<String> {
+        let dir = self.run(&["rev-parse", "--absolute-git-dir"]).ok()?;
+        let path = Path::new(dir.trim()).join("MERGE_MSG");
+        let text = std::fs::read_to_string(path).ok()?;
+        let body: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        let body = body.join("
+").trim().to_string();
+        if body.is_empty() {
+            None
+        } else {
+            Some(body)
+        }
+    }
+
+    pub fn abort_merge(&self) -> Result<()> {
+        self.run(&["merge", "--abort"]).map(|_| ())
+    }
+
+    /// Resolves a conflict by taking one side wholesale. `ours` is the current
+    /// branch, `theirs` the one being merged in.
+    pub fn take_side(&self, path: &str, ours: bool) -> Result<()> {
+        let side = if ours { "--ours" } else { "--theirs" };
+        self.run(&["checkout", side, "--", path])?;
+        self.run(&["add", "--", path]).map(|_| ())
+    }
+
     pub fn branches(&self) -> Result<Vec<String>> {
         let out = self.run(&[
             "for-each-ref",
@@ -522,6 +599,25 @@ impl Repo {
             args.extend_from_slice(&refs);
             self.run(&args).map(|_| ())
         }
+    }
+
+    pub fn unstage_paths_from(&self, base: &str, paths: &[String]) -> Result<()> {
+        for p in paths {
+            if self.run(&["cat-file", "-e", &format!("{base}:{p}")]).is_ok() {
+                self.run(&["restore", "--source", base, "--staged", "--", p])?;
+            } else {
+                self.run(&[
+                    "rm",
+                    "--cached",
+                    "--force",
+                    "--quiet",
+                    "--ignore-unmatch",
+                    "--",
+                    p,
+                ])?;
+            }
+        }
+        Ok(())
     }
 
     pub fn checkout_paths(&self, paths: &[String]) -> Result<()> {

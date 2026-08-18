@@ -23,11 +23,19 @@ impl eframe::App for GitGui {
 }
 
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 840.0])
+        .with_min_inner_size([760.0, 480.0])
+        .with_title("Git GUI");
+
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+    {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(err) => eprintln!("could not decode the window icon: {err}"),
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 840.0])
-            .with_min_inner_size([760.0, 480.0])
-            .with_title("Git GUI"),
+        viewport,
         ..Default::default()
     };
 

@@ -90,3 +90,56 @@ pub fn load_font_size() -> Option<f32> {
 pub fn save_font_size(v: f32) {
     write("font_size.txt", &format!("{v}"));
 }
+
+pub fn load_hide_untracked() -> bool {
+    let Some(path) = file("hide_untracked.txt") else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.trim() == "1"
+}
+
+pub fn save_hide_untracked(v: bool) {
+    write("hide_untracked.txt", if v { "1" } else { "0" });
+}
+
+/// An editor command that overrides git's `core.editor`, for when that is set
+/// up for commit messages rather than for browsing source.
+pub fn load_editor() -> Option<String> {
+    if let Some(v) = std::env::var_os("GITGUI_EDITOR") {
+        let v = v.to_string_lossy().trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let path = file("editor.txt")?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hide_untracked_round_trips() {
+        let dir = std::env::temp_dir().join(format!("gitgui-cfg-hide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("GITGUI_CONFIG_DIR", &dir);
+
+        assert!(!load_hide_untracked(), "no setting yet means untracked files show");
+        save_hide_untracked(true);
+        assert!(load_hide_untracked());
+        save_hide_untracked(false);
+        assert!(!load_hide_untracked());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

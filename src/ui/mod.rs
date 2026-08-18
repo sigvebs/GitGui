@@ -169,6 +169,17 @@ fn top_bar(ctx: &egui::Context, app: &mut App) {
                     {
                         app.open_stash_dialog();
                     }
+                    let mut hide = app.hide_untracked;
+                    if ui
+                        .checkbox(&mut hide, "Hide Untracked")
+                        .on_hover_text(
+                            "Leave new, never-committed files out of the unstaged \
+                             list so only changes to tracked files show",
+                        )
+                        .changed()
+                    {
+                        app.set_hide_untracked(hide);
+                    }
                 }
                 if ui
                     .button("Find")
@@ -362,18 +373,24 @@ fn file_list(ui: &mut Ui, app: &mut App, pane: Pane) {
     let pal = Palette::new(ui.visuals().dark_mode);
     let (title, entries) = if staged {
         (
-            "Staged Changes (Will Commit)",
-            app.status
-                .staged()
+            if app.amend {
+                "Staged Changes (Will Amend)"
+            } else {
+                "Staged Changes (Will Commit)"
+            },
+            app.staged()
                 .iter()
                 .map(|e| (e.path.clone(), e.display_path(), e.index, false))
                 .collect::<Vec<_>>(),
         )
     } else {
         (
-            "Unstaged Changes",
-            app.status
-                .unstaged()
+            if app.hide_untracked {
+                "Unstaged Changes (Tracked Only)"
+            } else {
+                "Unstaged Changes"
+            },
+            app.unstaged()
                 .iter()
                 .map(|e| {
                     (
@@ -403,6 +420,8 @@ fn file_list(ui: &mut Ui, app: &mut App, pane: Pane) {
     let mut clicked: Option<String> = None;
     let mut toggled: Option<String> = None;
     let mut discard: Option<String> = None;
+    let mut take_ours: Option<String> = None;
+    let mut take_theirs: Option<String> = None;
 
     egui::ScrollArea::vertical()
         .id_salt(if staged { "staged-list" } else { "unstaged-list" })
@@ -445,7 +464,31 @@ fn file_list(ui: &mut Ui, app: &mut App, pane: Pane) {
                                 ui.close();
                             }
                         } else {
-                            if ui.button("Stage File").clicked() {
+                            if *unmerged {
+                                if ui
+                                    .button("Use Ours (this branch)")
+                                    .on_hover_text("Keep this branch's version and mark it resolved")
+                                    .clicked()
+                                {
+                                    take_ours = Some(path.clone());
+                                    ui.close();
+                                }
+                                if ui
+                                    .button("Use Theirs (incoming)")
+                                    .on_hover_text("Take the merged branch's version and mark it resolved")
+                                    .clicked()
+                                {
+                                    take_theirs = Some(path.clone());
+                                    ui.close();
+                                }
+                                ui.separator();
+                            }
+                            let stage_label = if *unmerged {
+                                "Mark Resolved (stage as-is)"
+                            } else {
+                                "Stage File"
+                            };
+                            if ui.button(stage_label).clicked() {
                                 toggled = Some(path.clone());
                                 ui.close();
                             }
@@ -470,6 +513,12 @@ fn file_list(ui: &mut Ui, app: &mut App, pane: Pane) {
     }
     if let Some(p) = discard {
         app.ask_discard_file(&p);
+    }
+    if let Some(p) = take_ours {
+        app.take_side(&p, true);
+    }
+    if let Some(p) = take_theirs {
+        app.take_side(&p, false);
     }
 }
 
@@ -1115,12 +1164,13 @@ fn commit_box(ui: &mut Ui, app: &mut App) {
             if ui.button("Sign Off").clicked() {
                 app.sign_off();
             }
-            let staged = app.status.staged().len();
-            ui.label(
-                egui::RichText::new(format!("{staged} file(s) staged"))
-                    .color(pal.note_fg)
-                    .small(),
-            );
+            let staged = app.staged_len();
+            let label = if app.amend {
+                format!("{staged} file(s) in commit")
+            } else {
+                format!("{staged} file(s) staged")
+            };
+            ui.label(egui::RichText::new(label).color(pal.note_fg).small());
         });
     });
 
@@ -1151,6 +1201,24 @@ fn status_bar(ctx: &egui::Context, app: &mut App) {
             ui.label(egui::RichText::new(app.branch_label()).strong());
             if let Some(up) = app.status.upstream.clone() {
                 ui.label(egui::RichText::new(format!("→ {up}")).color(pal.note_fg).small());
+            }
+
+            if let Some(name) = app.merging.clone() {
+                ui.separator();
+                let unresolved = app.unresolved().len();
+                let text = if unresolved == 0 {
+                    format!("merging {name} — all resolved, commit to finish")
+                } else {
+                    format!("merging {name} — {unresolved} conflict(s) left")
+                };
+                ui.colored_label(Color32::from_rgb(225, 150, 60), text);
+                if ui
+                    .small_button("Abort Merge")
+                    .on_hover_text("git merge --abort: throw the merge away and go back")
+                    .clicked()
+                {
+                    app.ask_abort_merge();
+                }
             }
 
             ui.separator();
@@ -1203,10 +1271,11 @@ fn truncate(s: &str, n: usize) -> String {
 
 fn modals(ctx: &egui::Context, app: &mut App) {
     if let Some(c) = app.confirm.as_ref() {
-        let (title, body) = match c {
+        let (title, body, action) = match c {
             Confirm::DropStash { label, .. } => (
                 "Drop stash?",
                 format!("Delete {label}.\n\nThis can be undone with ⌘Z straight afterwards."),
+                "Drop",
             ),
             Confirm::DiscardFile { path, untracked } => (
                 "Discard file?",
@@ -1215,6 +1284,12 @@ fn modals(ctx: &egui::Context, app: &mut App) {
                 } else {
                     format!("Revert all changes in {path}.\nThis cannot be undone.")
                 },
+                "Discard",
+            ),
+            Confirm::AbortMerge => (
+                "Abort merge?",
+                "Throw the merge away and put the working tree back where it was before it started. Any conflict resolutions made so far are lost.".to_string(),
+                "Abort Merge",
             ),
         };
         let mut yes = false;
@@ -1230,13 +1305,8 @@ fn modals(ctx: &egui::Context, app: &mut App) {
                     if ui.button("Cancel").clicked() {
                         no = true;
                     }
-                    let verb = if title.starts_with("Drop") {
-                        "Drop"
-                    } else {
-                        "Discard"
-                    };
                     if ui
-                        .add(egui::Button::new(verb).fill(Color32::from_rgb(160, 60, 60)))
+                        .add(egui::Button::new(action).fill(Color32::from_rgb(160, 60, 60)))
                         .clicked()
                     {
                         yes = true;

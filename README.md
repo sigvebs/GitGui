@@ -29,8 +29,11 @@ cargo run --release
 ```
 
 Run from inside a checkout it opens that repository. Run with no repository in
-context — from Finder, the Dock, or Launchpad — it shows the welcome screen with
-your recent repositories. You can also point it at one:
+context — from Finder, the Dock, Launchpad, or a pinned taskbar shortcut — it
+shows the welcome screen with your recent repositories. A working directory that
+is simply the binary's own folder does not count as a choice, since that is what
+those launchers hand over; otherwise a build sitting in `target/release` would
+always reopen the repository it was built from. You can also point it at one:
 
 ```bash
 cargo run --release -- /path/to/repo
@@ -49,7 +52,7 @@ Click a file in either pane to see its diff. Then:
 | Action | Gesture |
 | --- | --- |
 | Select one line | click |
-| Select a range | shift-click, or click and drag |
+| Select a range | shift-click, or drag in the line-number gutter |
 | Add/remove one line | ⌘-click (Ctrl-click on Windows) |
 | Select a whole hunk | click the `@@ … @@` header |
 | Select every change | ⌘A |
@@ -58,11 +61,22 @@ Click a file in either pane to see its diff. Then:
 | Stage / unstage the hunk at the cursor | H, or double-click |
 | Discard the selection (unstaged pane) | Backspace |
 | Undo the last discard | ⌘Z |
+| Select text | drag across the text |
+| Copy the text selection, or the selected lines | ⌘C |
+| Open the cursor's line in your editor | E, or double-click the name above the diff |
 | Move / extend the cursor | ↑ ↓ (or J/K), Shift+↑ ↓ |
 
 Whether Space stages or unstages depends on which pane you are looking at —
 viewing unstaged changes it stages, viewing staged changes it unstages. Right
 click for the same actions as a menu.
+
+Selecting text and picking lines are separate gestures, split by where the drag
+begins. Dragging over the text highlights characters, as anywhere else; dragging
+in the line-number gutter sweeps whole lines for staging. A plain click still
+picks a line either way. `⌘C` copies the highlight when there is one and the
+selected lines otherwise, and in both cases you get the code alone — no line
+numbers, and no `+` or `-` markers to strip out afterwards. That is also why the
+marker column itself never highlights: it belongs to the gutter, not the text.
 
 With nothing selected, Space falls back to the hunk under the cursor, so
 click-then-Space works without a precise selection.
@@ -79,6 +93,67 @@ so deleting an untracked binary is recoverable as well.
 
 Undo covers only discards. Staging and unstaging leave your content in the
 working tree, so there is nothing to take back.
+
+## Editing a line
+
+Spotting a typo or a formatting slip while reading a diff is common, so `E` (or
+**Edit at This Line** in the right-click menu) hands the file to your editor at
+the line under the cursor. There is deliberately no editor inside this app: your
+own one already has spell-check, formatting and syntax awareness, and a buffer
+here would fight the line-staging model, since row and hunk indices shift as
+text changes underneath them.
+
+The command is resolved most-specific first:
+
+1. `GITGUI_EDITOR`, or an `editor.txt` file in the settings directory
+2. git's `core.editor`
+3. `$VISUAL`, then `$EDITOR`
+4. failing all of those, whatever the system opens the file with
+
+Line numbers are passed the way each editor expects — `-g file:N` for VS Code,
+`-nN` for Notepad++, `+N` for vi-family editors, `--line N` for JetBrains IDEs.
+An unrecognised editor is simply handed the file, with no invented flag.
+
+Use the override when `core.editor` is set up for commit messages rather than for
+browsing source — flags like Notepad++'s `-notabbar` make sense for a commit
+buffer and not much else:
+
+```
+GITGUI_EDITOR=code
+```
+
+The line is the *new* side's number, which is the working-tree line. A deleted
+line has no new-side number, so the nearest one above it is used.
+
+## Finishing a merge
+
+Starting a merge is still a terminal job, but once `git merge` has stopped on
+conflicts this app can carry it to the commit. While `MERGE_HEAD` exists the
+status bar says so — `merging side — 2 conflict(s) left` — and offers
+**Abort Merge**, which asks first because it throws the resolutions away.
+
+Conflicted files show with a `U` in the unstaged pane. Right-click one for:
+
+| Action | What it does |
+| --- | --- |
+| Use Ours (this branch) | `git checkout --ours`, then stages it |
+| Use Theirs (incoming) | `git checkout --theirs`, then stages it |
+| Mark Resolved (stage as-is) | stages whatever is on disk, markers fixed by hand |
+
+`E` opens the file in your editor at the cursor's line, which is the quickest way
+to deal with the conflict markers themselves.
+
+The commit message is prefilled from git's own `MERGE_MSG`, comment lines
+stripped. Commit is refused while any conflict is unresolved, naming the first
+one, rather than letting git fail later.
+
+One case worth knowing: resolving every conflict in favour of *ours* leaves the
+index identical to `HEAD`, so the staged pane can be completely empty. The commit
+is still both necessary and allowed, because it is what records the second
+parent — so the usual "nothing staged" guard is lifted during a merge.
+
+A file added on only one side has no `--ours` or `--theirs` version; taking a
+side there fails, and the message says to stage or remove it instead.
 
 ## Searching a diff
 
@@ -183,9 +258,22 @@ The one case undo cannot help with: if you edit the file after discarding, the
 stored patch no longer applies. It says so and keeps the entry rather than
 dropping the content silently.
 
+## Amending
+
+`Amend Last Commit` loads the previous message and re-bases the staged pane on
+the commit's parent instead of `HEAD`, so the pane lists everything the
+rewritten commit will contain — the changes already in it as well as anything
+newly staged on top. Clicking one of those files shows its diff against the
+parent, and unstaging reaches the same base: a line, hunk, or whole file taken
+out of the pane leaves the amended commit and reappears as unstaged work. The
+worktree is never touched. Amending a root commit diffs against the empty tree,
+so its entire content is listed.
+
 Other bits: `Rescan` (⌘R) re-reads status, `Stage Changed` is `git add -u`,
-`Sign Off` appends a `Signed-off-by` trailer, `Amend Last Commit` loads the
-previous message, and the Branch menu creates and switches branches.
+`Sign Off` appends a `Signed-off-by` trailer, `Hide Untracked` leaves new,
+never-committed files out of the unstaged list so only changes to tracked files
+show (remembered between runs), and the Branch menu creates and switches
+branches.
 
 ## How partial staging works
 
@@ -289,9 +377,10 @@ mocked git.
 
 Deliberate gaps, so you know what you are getting:
 
-- **No fetch, pull or merge.** Push exists and runs on a background thread; the
-  same plumbing would carry fetch and pull, but merge also needs conflict
-  handling, which this has none of. Use the terminal for those.
+- **No fetch, pull or merge command.** Push exists and runs on a background
+  thread; the same plumbing would carry fetch and pull. Starting a merge is still
+  a terminal job, but a merge already underway can be finished here - see
+  *Finishing a merge*.
 - **No credential prompting.** By design — see *Pushing*. A repository that
   needs an interactive username and password will fail rather than hang; set up
   a credential helper or SSH key once and it works.
@@ -303,8 +392,9 @@ Deliberate gaps, so you know what you are getting:
 - **No commit graph drawing.** Commits are a flat list, not gitk's branch lanes.
 - **Search covers the open diff only**, not the whole repository or history.
   `git grep` and `git log -S` are the tools for that.
-- **Conflicted files** can be viewed and staged whole once you have resolved the
-  markers in an editor, but there is no merge tool.
+- **No visual merge tool.** Conflicts can be resolved by taking a whole side, or
+  by fixing the markers in your editor and staging the file; there is no
+  three-pane ours/base/theirs view.
 - Renames are detected and displayed; line-level unstaging of a rename *with*
   content changes passes the rename header through to `git apply` and mostly
   works, but is the least exercised path here.

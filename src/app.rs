@@ -7,7 +7,7 @@ use crate::git::diff::{self, FileDiff, LineKind};
 use crate::git::log::{CommitFile, CommitInfo, CommitMeta};
 use crate::git::patch::{self, ApplyMode};
 use crate::git::stash::{StashEntry, StashFile};
-use crate::git::status::Status;
+use crate::git::status::{Change, Entry, Status};
 use crate::git::{PushOptions, Repo};
 
 /// Files larger than this are summarised rather than rendered, so opening a
@@ -108,6 +108,37 @@ pub enum Row {
     Note(String),
 }
 
+/// A caret position inside the diff text: a row, and a character offset into
+/// that row's own content. The diff marker and line numbers are not part of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TextPos {
+    pub row: usize,
+    pub col: usize,
+}
+
+/// A free text selection, independent of the line selection used for staging.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TextSel {
+    pub anchor: TextPos,
+    pub head: TextPos,
+}
+
+impl TextSel {
+    pub fn ordered(&self) -> (TextPos, TextPos) {
+        let a = self.anchor;
+        let b = self.head;
+        if (a.row, a.col) <= (b.row, b.col) {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
 /// The currently displayed diff plus its selection state.
 pub struct Loaded {
     pub fd: FileDiff,
@@ -115,6 +146,14 @@ pub struct Loaded {
     /// Row indices the user has selected. Only change rows are ever inserted.
     pub sel: HashSet<usize>,
     pub anchor: Option<usize>,
+    /// Free text selection, set by dragging across the text rather than the
+    /// line-number gutter.
+    pub text_sel: Option<TextSel>,
+    pub text_dragging: bool,
+    /// Where a press over the text landed, kept so a drag can anchor there
+    /// rather than wherever the pointer had reached by the time egui called it
+    /// a drag.
+    pub text_press: Option<TextPos>,
     pub cursor: usize,
     pub dragging: bool,
     /// Widest row in characters, for horizontal scroll extent.
@@ -147,6 +186,9 @@ impl Loaded {
             rows,
             sel: HashSet::new(),
             anchor: None,
+            text_sel: None,
+            text_dragging: false,
+            text_press: None,
             cursor: 0,
             dragging: false,
             max_chars,
@@ -155,6 +197,131 @@ impl Loaded {
             viewport_h: 0.0,
             scroll_to_cursor: false,
         }
+    }
+
+    /// The characters of one row that can be selected as text: the line's own
+    /// content, without the diff marker or the line numbers. Rows that are not
+    /// file content — notes, and the "no newline" marker — have none.
+    pub fn row_text(&self, row: usize) -> Option<String> {
+        match self.rows.get(row)? {
+            Row::Line { hunk, line } => {
+                let l = self.fd.hunks.get(*hunk)?.lines.get(*line)?;
+                if l.kind == LineKind::NoNewline {
+                    None
+                } else {
+                    Some(l.text.clone())
+                }
+            }
+            Row::Hunk(h) => Some(self.fd.hunks.get(*h)?.header()),
+            Row::Note(_) => None,
+        }
+    }
+
+    pub fn begin_text_sel(&mut self, at: TextPos) {
+        self.text_sel = Some(TextSel {
+            anchor: at,
+            head: at,
+        });
+        self.text_dragging = true;
+    }
+
+    pub fn set_text_head(&mut self, at: TextPos) {
+        if let Some(sel) = self.text_sel.as_mut() {
+            sel.head = at;
+        }
+    }
+
+    pub fn clear_text_sel(&mut self) {
+        self.text_sel = None;
+        self.text_dragging = false;
+        self.text_press = None;
+    }
+
+    /// The highlighted character range on one row, if any.
+    pub fn text_sel_span(&self, row: usize) -> Option<(usize, usize)> {
+        let sel = self.text_sel?;
+        if sel.is_empty() {
+            return None;
+        }
+        let (start, end) = sel.ordered();
+        if row < start.row || row > end.row {
+            return None;
+        }
+        let len = self.row_text(row)?.chars().count();
+        let from = if row == start.row { start.col } else { 0 };
+        let to = if row == end.row { end.col } else { len };
+        let (from, to) = (from.min(len), to.min(len));
+        if to > from {
+            Some((from, to))
+        } else {
+            None
+        }
+    }
+
+    fn text_selection_string(&self) -> Option<String> {
+        let sel = self.text_sel?;
+        if sel.is_empty() {
+            return None;
+        }
+        let (start, end) = sel.ordered();
+        let mut out = String::new();
+        let mut wrote_any = false;
+        for row in start.row..=end.row {
+            let Some(text) = self.row_text(row) else {
+                continue;
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let from = if row == start.row {
+                start.col.min(chars.len())
+            } else {
+                0
+            };
+            let to = if row == end.row {
+                end.col.min(chars.len())
+            } else {
+                chars.len()
+            };
+            if wrote_any {
+                out.push('\n');
+            }
+            wrote_any = true;
+            if to > from {
+                out.extend(chars[from..to].iter());
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn selected_lines_string(&self) -> Option<String> {
+        if self.sel.is_empty() {
+            return None;
+        }
+        let mut rows: Vec<usize> = self.sel.iter().copied().collect();
+        rows.sort_unstable();
+        let mut out = String::new();
+        for r in rows {
+            if let Some(t) = self.row_text(r) {
+                out.push_str(&t);
+                out.push('\n');
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// What a copy should put on the clipboard: the text highlight when there is
+    /// one, otherwise the lines picked out for staging. Either way it is the
+    /// code alone, with no markers or line numbers.
+    pub fn clipboard_text(&self) -> Option<String> {
+        self.text_selection_string()
+            .or_else(|| self.selected_lines_string())
     }
 
     pub fn pair_at(&self, row: usize) -> Option<(usize, usize)> {
@@ -274,6 +441,7 @@ impl Loaded {
 pub enum Confirm {
     DiscardFile { path: String, untracked: bool },
     DropStash { refname: String, label: String },
+    AbortMerge,
 }
 
 /// A git command running off the UI thread. Only network operations need this;
@@ -327,6 +495,7 @@ pub struct App {
     pub diff: Option<Loaded>,
     pub commit_msg: String,
     pub amend: bool,
+    pub amend_staged: Vec<Entry>,
     pub error: Option<String>,
     pub info: Option<String>,
     pub git_version: String,
@@ -337,6 +506,10 @@ pub struct App {
     pub new_branch: String,
     pub show_new_branch: bool,
     pub font_size: f32,
+    pub hide_untracked: bool,
+    /// Name of the branch being merged in, while a conflicted merge is waiting
+    /// to be committed.
+    pub merging: Option<String>,
     /// Set when the diff should regain keyboard focus next frame.
     pub focus_diff: bool,
     /// Most recent discards, newest last. Discards are the only destructive
@@ -384,6 +557,7 @@ impl Default for App {
             diff: None,
             commit_msg: String::new(),
             amend: false,
+            amend_staged: Vec::new(),
             error: None,
             info: None,
             git_version: String::new(),
@@ -394,6 +568,8 @@ impl Default for App {
             new_branch: String::new(),
             show_new_branch: false,
             font_size: 12.0,
+            hide_untracked: false,
+            merging: None,
             focus_diff: false,
             undo: Vec::new(),
             mode: Mode::WorkingTree,
@@ -424,6 +600,39 @@ impl Default for App {
     }
 }
 
+/// Repository locations to try at startup, most deliberate first.
+///
+/// A working directory equal to the binary's own folder is dropped: that is
+/// what a taskbar pin, a Dock launch or double-clicking the executable hands
+/// over, so treating it as a choice would open whichever repository the binary
+/// happens to be built inside.
+pub fn startup_candidates(
+    arg: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    exe_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(a) = arg {
+        out.push(a);
+    }
+    if let Some(dir) = cwd {
+        let launched_from_program_folder = exe_dir
+            .map(|e| same_dir(&dir, &e))
+            .unwrap_or(false);
+        if !launched_from_program_folder {
+            out.push(dir);
+        }
+    }
+    out
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 impl App {
     pub fn new() -> App {
         let mut app = App::default();
@@ -433,16 +642,20 @@ impl App {
         }
         app.recent = config::load_recent();
         app.font_size = config::load_font_size().unwrap_or(12.0);
+        app.hide_untracked = config::load_hide_untracked();
 
         // An explicit path wins, then the working directory so `gitgui` inside a
-        // checkout just opens it. With neither — a Finder or Dock launch — stop
-        // at the welcome screen so the recent list is what you see, rather than
-        // silently reopening whatever was last used.
-        let candidates = std::env::args_os()
-            .nth(1)
-            .map(PathBuf::from)
-            .into_iter()
-            .chain(std::env::current_dir().ok());
+        // checkout just opens it. With neither — a Finder, Dock or taskbar
+        // launch — stop at the welcome screen so the recent list is what you
+        // see, rather than silently reopening whatever was last used.
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let candidates = startup_candidates(
+            std::env::args_os().nth(1).map(PathBuf::from),
+            std::env::current_dir().ok(),
+            exe_dir,
+        );
         for p in candidates {
             if let Ok(repo) = Repo::discover(&p) {
                 app.open(repo.root.clone());
@@ -464,6 +677,7 @@ impl App {
                 self.diff = None;
                 self.commit_msg.clear();
                 self.amend = false;
+                self.amend_staged.clear();
                 self.error = None;
                 config::push_recent(&mut self.recent, &repo.root);
                 self.rescan();
@@ -501,6 +715,13 @@ impl App {
                 self.status = st;
                 self.branches = repo.branches().unwrap_or_default();
                 self.remotes = repo.remotes().unwrap_or_default();
+                self.merging = repo.merge_head();
+                if self.merging.is_some() && self.commit_msg.trim().is_empty() {
+                    if let Some(m) = repo.merge_message() {
+                        self.commit_msg = m;
+                    }
+                }
+                self.refresh_amend_staged();
                 self.reload_diff();
                 if self.mode == Mode::History {
                     self.load_log();
@@ -509,6 +730,165 @@ impl App {
                 self.find_recompute();
             }
             Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    pub fn staged(&self) -> Vec<Entry> {
+        if self.amend {
+            self.amend_staged.clone()
+        } else {
+            self.status.staged().into_iter().cloned().collect()
+        }
+    }
+
+    pub fn staged_len(&self) -> usize {
+        if self.amend {
+            self.amend_staged.len()
+        } else {
+            self.status.staged().len()
+        }
+    }
+
+    fn staged_entry(&self, path: &str) -> Option<Entry> {
+        if self.amend {
+            self.amend_staged.iter().find(|e| e.path == path).cloned()
+        } else {
+            self.status
+                .entries
+                .iter()
+                .find(|e| e.path == path)
+                .cloned()
+        }
+    }
+
+    fn refresh_amend_staged(&mut self) {
+        self.amend_staged.clear();
+        if !self.amend {
+            return;
+        }
+        let Some(repo) = self.repo() else { return };
+        let base = repo.amend_base();
+        match repo.staged_files(&base) {
+            Ok(files) => {
+                self.amend_staged = files
+                    .into_iter()
+                    .map(|f| Entry {
+                        path: f.path,
+                        orig_path: f.orig_path,
+                        index: f.status,
+                        worktree: Change::Unchanged,
+                        unmerged: false,
+                        untracked: false,
+                    })
+                    .collect();
+                self.amend_staged.sort_by(|a, b| a.path.cmp(&b.path));
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Absolute path of the open file, or None when it is not on disk — a
+    /// deleted file, or one that only exists inside a historical commit.
+    pub fn open_target(&self) -> Option<PathBuf> {
+        let repo = self.repo.as_ref()?;
+        let sel = self.sel_file.as_ref()?;
+        let full = repo.root.join(&sel.path);
+        if full.exists() {
+            Some(full)
+        } else {
+            None
+        }
+    }
+
+    /// The line in the *new* side of the diff that the cursor sits on, which is
+    /// the working-tree line number. Deletions have no new-side line, so the
+    /// nearest one above is used, falling back to the hunk's start.
+    pub fn cursor_line(&self) -> u32 {
+        let Some(d) = self.diff.as_ref() else {
+            return 1;
+        };
+        for row in (0..=d.cursor.min(d.rows.len().saturating_sub(1))).rev() {
+            if let Some((h, l)) = d.pair_at(row) {
+                if let Some(n) = d.fd.hunks.get(h).and_then(|hk| hk.lines.get(l)) {
+                    if let Some(no) = n.new_no {
+                        return no;
+                    }
+                }
+            }
+        }
+        d.hunk_of_row(d.cursor)
+            .and_then(|h| d.fd.hunks.get(h))
+            .map(|h| h.new_start.max(1))
+            .unwrap_or(1)
+    }
+
+    /// The editor command to use, most specific first: this app's own override,
+    /// then git's `core.editor`, then the usual environment variables. None
+    /// means fall back to whatever the system opens the file with.
+    fn editor_command(&self) -> Option<String> {
+        if let Some(c) = config::load_editor() {
+            return Some(c);
+        }
+        if let Some(repo) = self.repo.as_ref() {
+            if let Ok(c) = repo.run(&["config", "--get", "core.editor"]) {
+                let c = c.trim().to_string();
+                if !c.is_empty() {
+                    return Some(c);
+                }
+            }
+        }
+        for key in ["VISUAL", "EDITOR"] {
+            if let Some(v) = std::env::var_os(key) {
+                let v = v.to_string_lossy().trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn edit_at_cursor(&mut self) {
+        let Some(sel) = self.sel_file.clone() else { return };
+        let Some(full) = self.open_target() else {
+            self.error = Some(format!(
+                "{} is not in the working tree, so there is nothing to edit.",
+                sel.path
+            ));
+            return;
+        };
+        let line = self.cursor_line();
+        match self.editor_command() {
+            Some(cmd) => match crate::desktop::open_in_editor(&cmd, &full, line) {
+                Ok(()) => {
+                    self.info = Some(format!("Opened {} at line {line}.", sel.path));
+                }
+                Err(e) => self.error = Some(format!("Could not open an editor: {e}")),
+            },
+            None => match crate::desktop::open(&full) {
+                Ok(()) => {
+                    self.info = Some(format!(
+                        "Opened {} with the system default. Set core.editor, or                          GITGUI_EDITOR, to jump to a line.",
+                        sel.path
+                    ));
+                }
+                Err(e) => self.error = Some(format!("Could not open {}: {e}", sel.path)),
+            },
+        }
+    }
+
+    pub fn open_selected_file(&mut self) {
+        let Some(sel) = self.sel_file.clone() else { return };
+        let Some(full) = self.open_target() else {
+            self.error = Some(format!(
+                "{} is not in the working tree, so there is no file to open.",
+                sel.path
+            ));
+            return;
+        };
+        match crate::desktop::open(&full) {
+            Ok(()) => self.info = Some(format!("Opened {}", sel.path)),
+            Err(e) => self.error = Some(format!("Could not open {}: {e}", sel.path)),
         }
     }
 
@@ -521,6 +901,35 @@ impl App {
         self.focus_diff = true;
         // Keep hit positions valid for the newly loaded content.
         self.find_recompute();
+    }
+
+    pub fn unstaged(&self) -> Vec<Entry> {
+        self.status
+            .unstaged()
+            .into_iter()
+            .filter(|e| !(self.hide_untracked && e.untracked))
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_hide_untracked(&mut self, on: bool) {
+        if self.hide_untracked == on {
+            return;
+        }
+        self.hide_untracked = on;
+        config::save_hide_untracked(on);
+        let hidden_selection = self
+            .sel_file
+            .as_ref()
+            .map(|s| {
+                s.pane == Pane::Unstaged && !self.unstaged().iter().any(|e| e.path == s.path)
+            })
+            .unwrap_or(false);
+        if hidden_selection {
+            self.sel_file = None;
+            self.diff = None;
+            self.find.matches.clear();
+        }
     }
 
     // ---- history --------------------------------------------------------
@@ -874,8 +1283,8 @@ impl App {
             return;
         };
         let still_there = match sel.pane {
-            Pane::Unstaged => self.status.unstaged().iter().any(|e| e.path == sel.path),
-            Pane::Staged => self.status.staged().iter().any(|e| e.path == sel.path),
+            Pane::Unstaged => self.unstaged().iter().any(|e| e.path == sel.path),
+            Pane::Staged => self.staged().iter().any(|e| e.path == sel.path),
             // Commit and stash contents are immutable, so a rescan never
             // invalidates them.
             Pane::Commit | Pane::Stash => true,
@@ -945,10 +1354,17 @@ impl App {
         } else {
             let text = match sel.pane {
                 Pane::Unstaged => repo.diff_unstaged(&sel.path),
-                Pane::Staged => repo.diff_staged(
-                    &sel.path,
-                    entry.as_ref().and_then(|e| e.orig_path.as_deref()),
-                ),
+                Pane::Staged => {
+                    let base = if self.amend {
+                        Some(repo.amend_base())
+                    } else {
+                        None
+                    };
+                    let orig = self
+                        .staged_entry(&sel.path)
+                        .and_then(|e| e.orig_path.clone());
+                    repo.diff_staged(&sel.path, orig.as_deref(), base.as_deref())
+                }
                 Pane::Commit => match self.sel_commit.as_deref() {
                     Some(sha) => {
                         let orig = self
@@ -1099,6 +1515,59 @@ impl App {
             Confirm::DropStash { refname, .. } => {
                 self.do_drop_stash(&refname);
             }
+            Confirm::AbortMerge => self.do_abort_merge(),
+        }
+    }
+
+    // ---- merges ---------------------------------------------------------
+
+    /// Conflicted paths still waiting on a decision.
+    pub fn unresolved(&self) -> Vec<String> {
+        self.status
+            .entries
+            .iter()
+            .filter(|e| e.unmerged)
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    pub fn ask_abort_merge(&mut self) {
+        if self.merging.is_none() {
+            return;
+        }
+        self.confirm = Some(Confirm::AbortMerge);
+    }
+
+    fn do_abort_merge(&mut self) {
+        let Some(repo) = self.repo() else { return };
+        match repo.abort_merge() {
+            Ok(()) => {
+                self.commit_msg.clear();
+                self.info = Some("Merge aborted.".into());
+                self.rescan();
+            }
+            Err(e) => self.error = Some(format!("Could not abort the merge: {e}")),
+        }
+    }
+
+    /// Resolves one conflicted file by taking a whole side. `ours` is the branch
+    /// being merged into, `theirs` the one being merged in.
+    pub fn take_side(&mut self, path: &str, ours: bool) {
+        let Some(repo) = self.repo() else { return };
+        match repo.take_side(path, ours) {
+            Ok(()) => {
+                let side = if ours { "ours" } else { "theirs" };
+                self.info = Some(format!("Resolved {path} using {side}."));
+                self.rescan();
+            }
+            Err(e) => {
+                let side = if ours { "--ours" } else { "--theirs" };
+                self.error = Some(format!(
+                    "Could not take {side} for {path}: {e}. A file added or \
+                     deleted on only one side has no such version; stage or \
+                     remove it instead."
+                ));
+            }
         }
     }
 
@@ -1212,14 +1681,20 @@ impl App {
         let Some(repo) = self.repo() else { return };
         // A staged rename has to release both names or the old path stays gone.
         let mut paths = vec![path.to_string()];
-        if let Some(e) = self.status.entries.iter().find(|e| e.path == path) {
-            if let Some(o) = &e.orig_path {
-                paths.push(o.clone());
-            }
+        if let Some(o) = self.staged_entry(path).and_then(|e| e.orig_path) {
+            paths.push(o);
         }
-        match repo.unstage_paths(&paths) {
+        match self.unstage(&repo, &paths) {
             Ok(()) => self.rescan(),
             Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    fn unstage(&self, repo: &Repo, paths: &[String]) -> crate::git::Result<()> {
+        if self.amend {
+            repo.unstage_paths_from(&repo.amend_base(), paths)
+        } else {
+            repo.unstage_paths(paths)
         }
     }
 
@@ -1288,12 +1763,18 @@ impl App {
     }
 
     pub fn unstage_all(&mut self) {
-        let paths: Vec<String> = self.status.staged().iter().map(|e| e.path.clone()).collect();
+        let mut paths: Vec<String> = Vec::new();
+        for e in self.staged() {
+            paths.push(e.path.clone());
+            if let Some(o) = e.orig_path {
+                paths.push(o);
+            }
+        }
         if paths.is_empty() {
             return;
         }
         let Some(repo) = self.repo() else { return };
-        match repo.unstage_paths(&paths) {
+        match self.unstage(&repo, &paths) {
             Ok(()) => self.rescan(),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1302,14 +1783,25 @@ impl App {
     // ---- commit ---------------------------------------------------------
 
     pub fn set_amend(&mut self, on: bool) {
-        self.amend = on;
-        if on && self.commit_msg.trim().is_empty() {
-            if let Some(repo) = self.repo() {
+        if on {
+            let Some(repo) = self.repo() else { return };
+            if !repo.has_head() {
+                self.amend = false;
+                self.amend_staged.clear();
+                self.error = Some("There is no commit to amend yet.".into());
+                return;
+            }
+            self.amend = true;
+            if self.commit_msg.trim().is_empty() {
                 if let Ok(m) = repo.last_commit_message() {
                     self.commit_msg = m.trim_end().to_string();
                 }
             }
+        } else {
+            self.amend = false;
         }
+        self.refresh_amend_staged();
+        self.reload_diff();
     }
 
     pub fn sign_off(&mut self) {
@@ -1333,8 +1825,12 @@ impl App {
     }
 
     pub fn can_commit(&self) -> bool {
-        !self.commit_msg.trim().is_empty()
-            && (self.amend || !self.status.staged().is_empty())
+        // A merge commit is legitimate with nothing staged: resolving every
+        // conflict in favour of this branch leaves the index matching HEAD, and
+        // the commit still has to happen to record the second parent.
+        let has_content =
+            self.amend || self.merging.is_some() || !self.status.staged().is_empty();
+        !self.commit_msg.trim().is_empty() && has_content && self.unresolved().is_empty()
     }
 
     pub fn commit(&mut self) {
@@ -1343,8 +1839,17 @@ impl App {
             self.error = Some("Enter a commit message first.".into());
             return;
         }
-        if !self.amend && self.status.staged().is_empty() {
+        if !self.amend && self.merging.is_none() && self.status.staged().is_empty() {
             self.error = Some("Nothing staged to commit.".into());
+            return;
+        }
+        let unresolved = self.unresolved();
+        if !unresolved.is_empty() {
+            self.error = Some(format!(
+                "{} conflicted file(s) still unresolved, starting with {}.",
+                unresolved.len(),
+                unresolved[0]
+            ));
             return;
         }
         match repo.commit(&self.commit_msg, self.amend) {
@@ -1353,6 +1858,8 @@ impl App {
                 self.info = Some(summary);
                 self.commit_msg.clear();
                 self.amend = false;
+                self.amend_staged.clear();
+                self.merging = None;
                 self.rescan();
             }
             Err(e) => self.error = Some(e.to_string()),
